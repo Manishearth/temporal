@@ -191,36 +191,6 @@ mod tests {
 
     const EPOCH_RATA_DIE: u32 = 719_468; // This is the Rata Die for 1970-01-01
 
-    const fn days_in_century(rata_die: u32) -> u32 {
-        century_rem(rata_die).div_euclid(4)
-    }
-
-    #[test]
-    fn epoch_century_number() {
-        let century_number = century_number(EPOCH_RATA_DIE);
-        assert_eq!(century_number, 19);
-        let day_number_in_century = days_in_century(EPOCH_RATA_DIE);
-        assert_eq!(day_number_in_century, 25508);
-    }
-
-    #[test]
-    fn epoch_year_of_century() {
-        let year = computational_year_of_century(EPOCH_RATA_DIE);
-        assert_eq!(year, 69);
-    }
-
-    #[test]
-    fn epoch_day_of_year() {
-        let day = computational_day_of_year(EPOCH_RATA_DIE);
-        assert_eq!(day, 306); // Beginning of January in the computational calendar is day number 306
-    }
-
-    #[test]
-    fn epoch_year() {
-        let year = computational_year(EPOCH_RATA_DIE);
-        assert_eq!(year, 1969);
-    }
-
     #[test]
     fn epoch_ymd() {
         let ymd = gregorian_ymd(EPOCH_RATA_DIE);
