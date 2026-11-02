@@ -558,7 +558,6 @@ pub(crate) enum TransitionKind {
     // The offsets changed in a way that produces overlapping time.
     Overlap,
 }
-
 #[cfg(all(test, any(feature = "tzif", feature = "experimental_tzif")))]
 mod tests {
     use super::{Mwd, MwdForTime};
@@ -600,5 +599,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn negative_epoch_seconds_day_of_week() {
+        // 1970-01-01T00:00:00Z is Thursday (4)
+        assert_eq!(utils::epoch_seconds_to_day_of_week(0), 4);
+        // 1969-12-31T23:59:59Z and 1969-12-31T12:00:00Z are Wednesday (3)
+        assert_eq!(utils::epoch_seconds_to_day_of_week(-1), 3);
+        assert_eq!(utils::epoch_seconds_to_day_of_week(-43_200), 3);
+        // 1969-12-31T00:00:00Z is Wednesday (3)
+        assert_eq!(utils::epoch_seconds_to_day_of_week(-86_400), 3);
+        // 1969-12-30T23:59:59Z is Tuesday (2)
+        assert_eq!(utils::epoch_seconds_to_day_of_week(-86_401), 2);
     }
 }

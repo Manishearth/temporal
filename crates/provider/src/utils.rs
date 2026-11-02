@@ -98,7 +98,7 @@ pub(crate) fn epoch_time_to_day_in_year(t: i64) -> i32 {
 
 #[cfg(any(feature = "tzif", feature = "experimental_tzif"))]
 pub(crate) fn epoch_seconds_to_day_of_week(t: i64) -> u8 {
-    ((t / 86_400) + 4).rem_euclid(7) as u8
+    (t.div_euclid(86_400) + 4).rem_euclid(7) as u8
 }
 
 // Trait implementations
