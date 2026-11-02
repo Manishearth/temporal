@@ -1,7 +1,8 @@
 use crate::{
     common::{
-        offset_range, DstTransitionInfoForYear, LocalTimeRecordResult, Mwd, MwdForTime,
-        TimeZoneTransitionInfo, TransitionType,
+        calculate_transition_seconds_for_year, offset_range, DstTransitionInfoForYear,
+        LocalTimeRecordResult, Mwd, MwdForTime, PosixTransitionDay, TimeZoneTransitionInfo,
+        TransitionType,
     },
     epoch_nanoseconds::EpochNanoseconds,
     provider::{GapEntryOffsets, TimeZoneProviderResult, UtcOffsetSeconds},
@@ -151,9 +152,10 @@ impl PosixZone {
             let transition_epoch = if dst_is_inversed && epoch_seconds < dst_end_seconds {
                 Some(calculate_transition_seconds_for_year(
                     year - 1,
-                    dst_transition_info.start,
+                    dst_transition_info.start.date.to_posix_day()?,
+                    dst_transition_info.start.time,
                     transition_info.dst_offset,
-                )?)
+                ))
             } else {
                 Some(dst_start_seconds)
             };
@@ -162,9 +164,10 @@ impl PosixZone {
             let transition_epoch = if !dst_is_inversed && epoch_seconds < dst_start_seconds {
                 Some(calculate_transition_seconds_for_year(
                     year - 1,
-                    dst_transition_info.end,
+                    dst_transition_info.end.date.to_posix_day()?,
+                    dst_transition_info.end.time,
                     transition_info.std_offset,
-                )?)
+                ))
             } else {
                 Some(dst_end_seconds)
             };
@@ -185,10 +188,18 @@ impl DstTransitionInfoForYear {
     ) -> TimeZoneProviderResult<Self> {
         let std_offset = UtcOffsetSeconds(std_offset_seconds);
         let dst_offset = UtcOffsetSeconds(std_offset_seconds + dst_transition.savings);
-        let dst_start_seconds =
-            calculate_transition_seconds_for_year(year, dst_transition.start, std_offset)?;
-        let dst_end_seconds =
-            calculate_transition_seconds_for_year(year, dst_transition.end, dst_offset)?;
+        let dst_start_seconds = calculate_transition_seconds_for_year(
+            year,
+            dst_transition.start.date.to_posix_day()?,
+            dst_transition.start.time,
+            std_offset,
+        );
+        let dst_end_seconds = calculate_transition_seconds_for_year(
+            year,
+            dst_transition.end.date.to_posix_day()?,
+            dst_transition.end.time,
+            dst_offset,
+        );
         Ok(Self {
             dst_start_seconds,
             dst_end_seconds,
@@ -198,111 +209,19 @@ impl DstTransitionInfoForYear {
     }
 }
 
-fn calculate_transition_seconds_for_year(
-    year: i32,
-    transition_dt: ZeroTransitionDateTime,
-    offset: UtcOffsetSeconds,
-) -> TimeZoneProviderResult<i64> {
-    // Determine the year of the requested time.
-    let year_epoch_seconds = i64::from(utils::epoch_days_for_year(year)) * 86400;
-    let is_leap = utils::is_leap(year);
-
-    // Calculate the days in the year for the TransitionDate
-    // This value is zero-indexed so it can be added to the year's epoch seconds
-    let days = match transition_dt.date {
-        ZeroTransitionDate {
-            kind: DateKind::JulianNoLeap,
-            day: Some(day),
-            ..
-        } if day > 59 => day - 1 + is_leap as u16,
-        ZeroTransitionDate {
-            kind: DateKind::JulianNoLeap,
-            day: Some(day),
-            ..
-        } => day - 1,
-        ZeroTransitionDate {
-            kind: DateKind::Julian,
-            day: Some(day),
-            ..
-        } => day,
-        ZeroTransitionDate {
-            kind: DateKind::MonthWeekDay,
-            mwd: Some((month, week, day)),
-            ..
-        } => {
-            let days_to_month = utils::month_to_day(month - 1, is_leap);
-            let days_in_month = utils::iso_days_in_month(year, month);
-
-            // Month starts in the day...
-            let day_offset = (u16::from(utils::epoch_seconds_to_day_of_week(year_epoch_seconds))
-                + days_to_month)
-                .rem_euclid(7) as u8;
-
-            // EXAMPLE:
-            //
-            // 0   1   2   3   4   5   6
-            // sun mon tue wed thu fri sat
-            // -   -   -   0   1   2   3
-            // 4   5   6   7   8   9   10
-            // 11  12  13  14  15  16  17
-            // 18  19  20  21  22  23  24
-            // 25  26  27  28  29  30  -
-            //
-            // The day_offset = 3, since the month starts on a wednesday.
-            //
-            // We're looking for the second friday of the month. Thus, since the month started before
-            // a friday, we need to start counting from week 0:
-            //
-            // day_of_month = (week - u16::from(day_offset <= day)) * 7 + day - day_offset = (2 - 1) * 7 + 5 - 3 = 9
-            //
-            // This works if the month started on a day before the day we want (day_offset <= day). However, if that's not the
-            // case, we need to start counting on week 1. For example, calculate the day of the month for the third monday
-            // of the month:
-            //
-            // day_of_month = (week - u16::from(day_offset <= day)) * 7 + day - day_offset = (3 - 0) * 7 + 1 - 3 = 19
-
-            // Note: this day_of_month is zero-indexed!
-            let mut day_of_month = (week - u8::from(day_offset <= day)) * 7 + day - day_offset;
-
-            // Week 5 actually means "last <dayofweek> of month". The day_of_month calculation
-            // above uses `week` directly; so we might end up spilling into the next month. In that
-            // case, we normalize to the fourth week of the month.
-            //
-            // Note that this only needs to be done once; if a month will have at least four of each
-            // day of the week since all months have 28 days or greater.
-            //
-            // We add one because day_of_month is zero_indexed
-            if day_of_month + 1 > days_in_month {
-                day_of_month -= 7
-            }
-
-            days_to_month + day_of_month as u16
-        }
-        _ => {
-            return Err(TimeZoneProviderError::Assert(
-                "Invalid TransitionDate found.",
-            ))
-        }
-    };
-
-    // Transition time is on local time, so we need to add the UTC offset to get the correct UTC timestamp
-    // for the transition.
-    Ok(year_epoch_seconds + i64::from(days) * 86400 + transition_dt.time - offset.0)
-}
-
 fn cmp_seconds_to_transitions(
     start: &ZeroTransitionDate,
     end: &ZeroTransitionDate,
     seconds: i64,
 ) -> TimeZoneProviderResult<(bool, TransitionType)> {
-    let cmp_result = match (start.to_enum()?, end.to_enum()?) {
+    let cmp_result = match (start.to_posix_day()?, end.to_posix_day()?) {
         (
-            TransitionDate::Mwd((start_month, start_week, start_day)),
-            TransitionDate::Mwd((end_month, end_week, end_day)),
+            PosixTransitionDay::Mwd(start_month, start_week, start_day),
+            PosixTransitionDay::Mwd(end_month, end_week, end_day),
         ) => {
             let mwd = MwdForTime::from_seconds(seconds);
-            let mut start = Mwd::from_u8(start_month, start_week, start_day);
-            let mut end = Mwd::from_u8(end_month, end_week, end_day);
+            let mut start = Mwd::from_u8(start_month as u8, start_week as u8, start_day as u8);
+            let mut end = Mwd::from_u8(end_month as u8, end_week as u8, end_day as u8);
 
             mwd.normalize_mwd(&mut start);
             mwd.normalize_mwd(&mut end);
@@ -316,7 +235,7 @@ fn cmp_seconds_to_transitions(
 
             (is_transition, is_dst)
         }
-        (TransitionDate::Julian(start), TransitionDate::Julian(end)) => {
+        (PosixTransitionDay::JulianWithLeap(start), PosixTransitionDay::JulianWithLeap(end)) => {
             let day_in_year = utils::epoch_time_to_day_in_year(seconds * 1_000) as u16;
             let is_transition = start == day_in_year || end == day_in_year;
             let is_dst = if start > end {
@@ -327,7 +246,7 @@ fn cmp_seconds_to_transitions(
             (is_transition, is_dst)
         }
         // TODO: do we need to modify the logic for leap years?
-        (TransitionDate::JulianNoLeap(start), TransitionDate::JulianNoLeap(end)) => {
+        (PosixTransitionDay::JulianNoLeap(start), PosixTransitionDay::JulianNoLeap(end)) => {
             let day_in_year = utils::epoch_time_to_day_in_year(seconds * 1_000) as u16;
             let is_transition = start == day_in_year || end == day_in_year;
             let is_dst = if start > end {
@@ -428,13 +347,6 @@ impl From<&PosixDateTime> for ZeroTransitionDateTime {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum TransitionDate {
-    Julian(u16),
-    JulianNoLeap(u16),
-    Mwd((u8, u8, u8)),
-}
-
 #[zerovec::make_ule(DateULE)]
 #[derive(PartialEq, Eq, Debug, Clone, Copy, PartialOrd, Ord)]
 #[cfg_attr(
@@ -449,23 +361,27 @@ pub struct ZeroTransitionDate {
 }
 
 impl ZeroTransitionDate {
-    pub(crate) fn to_enum(self) -> TimeZoneProviderResult<TransitionDate> {
+    pub(crate) fn to_posix_day(self) -> TimeZoneProviderResult<PosixTransitionDay> {
         match self {
             ZeroTransitionDate {
                 kind: DateKind::JulianNoLeap,
                 day: Some(day),
                 ..
-            } => Ok(TransitionDate::JulianNoLeap(day)),
+            } => Ok(PosixTransitionDay::JulianNoLeap(day)),
             ZeroTransitionDate {
                 kind: DateKind::Julian,
                 day: Some(day),
                 ..
-            } => Ok(TransitionDate::Julian(day)),
+            } => Ok(PosixTransitionDay::JulianWithLeap(day)),
             ZeroTransitionDate {
                 kind: DateKind::MonthWeekDay,
-                mwd: Some(mwd),
+                mwd: Some((month, week, day)),
                 ..
-            } => Ok(TransitionDate::Mwd(mwd)),
+            } => Ok(PosixTransitionDay::Mwd(
+                u16::from(month),
+                u16::from(week),
+                u16::from(day),
+            )),
             _ => Err(TimeZoneProviderError::Assert("Invalid ZeroTransitionDate")),
         }
     }

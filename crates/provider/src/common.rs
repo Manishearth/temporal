@@ -9,7 +9,7 @@ use core::ops::Range;
 
 #[cfg(feature = "tzif")]
 use tzif::data::{
-    posix::{DstTransitionInfo, PosixTzString, TransitionDate, TransitionDay},
+    posix::{DstTransitionInfo, PosixTzString, TransitionDay},
     tzif::LocalTimeTypeRecord,
 };
 
@@ -63,6 +63,28 @@ impl From<(LocalTimeTypeRecord, LocalTimeTypeRecord)> for LocalTimeRecordResult 
     }
 }
 
+/// Day specification in a POSIX TZ transition rule.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PosixTransitionDay {
+    /// `Jn`: 1-based Julian day (1..=365), Feb 29 is never counted.
+    JulianNoLeap(u16),
+    /// `n`: 0-based Julian day (0..=365), Feb 29 is counted in leap years.
+    JulianWithLeap(u16),
+    /// `Mm.w.d`: month (1..=12), week (1..=5), day of week (0..=6, Sunday=0).
+    Mwd(u16, u16, u16),
+}
+
+#[cfg(feature = "tzif")]
+impl From<TransitionDay> for PosixTransitionDay {
+    fn from(value: TransitionDay) -> Self {
+        match value {
+            TransitionDay::NoLeap(day) => Self::JulianNoLeap(day),
+            TransitionDay::WithLeap(day) => Self::JulianWithLeap(day),
+            TransitionDay::Mwd(month, week, day) => Self::Mwd(month, week, day),
+        }
+    }
+}
+
 /// Stores the information about DST transitions for a given year
 pub(crate) struct DstTransitionInfoForYear {
     pub(crate) dst_start_seconds: i64,
@@ -80,10 +102,18 @@ impl DstTransitionInfoForYear {
     ) -> Self {
         let std_offset = UtcOffsetSeconds::from(&posix_tz_string.std_info);
         let dst_offset = UtcOffsetSeconds::from(&dst_variant.variant_info);
-        let dst_start_seconds =
-            calculate_transition_seconds_for_year(year, dst_variant.start_date, std_offset);
-        let dst_end_seconds =
-            calculate_transition_seconds_for_year(year, dst_variant.end_date, dst_offset);
+        let dst_start_seconds = calculate_transition_seconds_for_year(
+            year,
+            dst_variant.start_date.day.into(),
+            dst_variant.start_date.time.0,
+            std_offset,
+        );
+        let dst_end_seconds = calculate_transition_seconds_for_year(
+            year,
+            dst_variant.end_date.day.into(),
+            dst_variant.end_date.time.0,
+            dst_offset,
+        );
         Self {
             dst_start_seconds,
             dst_end_seconds,
@@ -112,10 +142,10 @@ impl DstTransitionInfoForYear {
     }
 }
 
-#[cfg(feature = "tzif")]
 pub(crate) fn calculate_transition_seconds_for_year(
     year: i32,
-    transition_date: TransitionDate,
+    transition_day: PosixTransitionDay,
+    transition_time_seconds: i64,
     offset: UtcOffsetSeconds,
 ) -> i64 {
     // Determine the year of the requested time.
@@ -124,11 +154,11 @@ pub(crate) fn calculate_transition_seconds_for_year(
 
     // Calculate the days in the year for the TransitionDate
     // This value is zero-indexed so it can be added to the year's epoch seconds
-    let days = match transition_date.day {
-        TransitionDay::NoLeap(day) if day > 59 => day - 1 + is_leap as u16,
-        TransitionDay::NoLeap(day) => day - 1,
-        TransitionDay::WithLeap(day) => day,
-        TransitionDay::Mwd(month, week, day) => {
+    let days = match transition_day {
+        PosixTransitionDay::JulianNoLeap(day) if day > 59 => day - 1 + is_leap as u16,
+        PosixTransitionDay::JulianNoLeap(day) => day - 1,
+        PosixTransitionDay::JulianWithLeap(day) => day,
+        PosixTransitionDay::Mwd(month, week, day) => {
             let days_to_month = utils::month_to_day((month - 1) as u8, is_leap);
             let days_in_month = u16::from(utils::iso_days_in_month(year, month as u8));
 
@@ -181,7 +211,7 @@ pub(crate) fn calculate_transition_seconds_for_year(
 
     // Transition time is on local time, so we need to add the UTC offset to get the correct UTC timestamp
     // for the transition.
-    year_epoch_seconds + i64::from(days) * 86400 + transition_date.time.0 - offset.0
+    year_epoch_seconds + i64::from(days) * 86400 + transition_time_seconds - offset.0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -31,14 +31,12 @@ use std::path::Path;
 #[cfg(target_family = "unix")]
 use std::path::PathBuf;
 
-use crate::common::{offset_range, Mwd, MwdForTime, TransitionType};
-use crate::CompiledNormalizer;
-use crate::{
-    common::{
-        DstTransitionInfoForYear, LocalTimeRecordResult, TimeZoneTransitionInfo, TransitionKind,
-    },
-    provider::EpochNanosecondsAndOffset,
+use crate::common::{
+    calculate_transition_seconds_for_year, offset_range, DstTransitionInfoForYear,
+    LocalTimeRecordResult, Mwd, MwdForTime, TimeZoneTransitionInfo, TransitionKind, TransitionType,
 };
+use crate::provider::EpochNanosecondsAndOffset;
+use crate::CompiledNormalizer;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -52,7 +50,7 @@ use combine::Parser;
 use tzif::{
     self,
     data::{
-        posix::{PosixTzString, TransitionDate, TransitionDay},
+        posix::{PosixTzString, TransitionDay},
         time::Seconds,
         tzif::{DataBlock, LocalTimeTypeRecord, TzifData, TzifHeader},
     },
@@ -816,7 +814,8 @@ fn resolve_posix_tz_string_for_epoch_seconds(
         let transition_epoch = if dst_is_inversed && seconds < dst_end_seconds {
             Some(calculate_transition_seconds_for_year(
                 year - 1,
-                dst_variant.start_date,
+                dst_variant.start_date.day.into(),
+                dst_variant.start_date.time.0,
                 transition_info.dst_offset,
             ))
         } else {
@@ -827,7 +826,8 @@ fn resolve_posix_tz_string_for_epoch_seconds(
         let transition_epoch = if !dst_is_inversed && seconds < dst_start_seconds {
             Some(calculate_transition_seconds_for_year(
                 year - 1,
-                dst_variant.end_date,
+                dst_variant.end_date.day.into(),
+                dst_variant.end_date.time.0,
                 transition_info.std_offset,
             ))
         } else {
@@ -839,77 +839,6 @@ fn resolve_posix_tz_string_for_epoch_seconds(
         offset: new_offset,
         transition_epoch,
     })
-}
-
-fn calculate_transition_seconds_for_year(
-    year: i32,
-    transition_date: TransitionDate,
-    offset: UtcOffsetSeconds,
-) -> i64 {
-    // Determine the year of the requested time.
-    let year_epoch_seconds = i64::from(utils::epoch_days_for_year(year)) * 86400;
-    let is_leap = utils::is_leap(year);
-
-    // Calculate the days in the year for the TransitionDate
-    // This value is zero-indexed so it can be added to the year's epoch seconds
-    let days = match transition_date.day {
-        TransitionDay::NoLeap(day) if day > 59 => day - 1 + is_leap as u16,
-        TransitionDay::NoLeap(day) => day - 1,
-        TransitionDay::WithLeap(day) => day,
-        TransitionDay::Mwd(month, week, day) => {
-            let days_to_month = utils::month_to_day((month - 1) as u8, is_leap);
-            let days_in_month = u16::from(utils::iso_days_in_month(year, month as u8));
-
-            // Month starts in the day...
-            let day_offset = (u16::from(utils::epoch_seconds_to_day_of_week(year_epoch_seconds))
-                + days_to_month)
-                .rem_euclid(7);
-
-            // EXAMPLE:
-            //
-            // 0   1   2   3   4   5   6
-            // sun mon tue wed thu fri sat
-            // -   -   -   0   1   2   3
-            // 4   5   6   7   8   9   10
-            // 11  12  13  14  15  16  17
-            // 18  19  20  21  22  23  24
-            // 25  26  27  28  29  30  -
-            //
-            // The day_offset = 3, since the month starts on a wednesday.
-            //
-            // We're looking for the second friday of the month. Thus, since the month started before
-            // a friday, we need to start counting from week 0:
-            //
-            // day_of_month = (week - u16::from(day_offset <= day)) * 7 + day - day_offset = (2 - 1) * 7 + 5 - 3 = 9
-            //
-            // This works if the month started on a day before the day we want (day_offset <= day). However, if that's not the
-            // case, we need to start counting on week 1. For example, calculate the day of the month for the third monday
-            // of the month:
-            //
-            // day_of_month = (week - u16::from(day_offset <= day)) * 7 + day - day_offset = (3 - 0) * 7 + 1 - 3 = 19
-
-            // Note: this day_of_month is zero-indexed!
-            let mut day_of_month = (week - u16::from(day_offset <= day)) * 7 + day - day_offset;
-
-            // Week 5 actually means "last <dayofweek> of month". The day_of_month calculation
-            // above uses `week` directly; so we might end up spilling into the next month. In that
-            // case, we normalize to the fourth week of the month.
-            //
-            // Note that this only needs to be done once; if a month will have at least four of each
-            // day of the week since all months have 28 days or greater.
-            //
-            // We add one because day_of_month is zero_indexed
-            if day_of_month + 1 > days_in_month {
-                day_of_month -= 7
-            }
-
-            days_to_month + day_of_month
-        }
-    };
-
-    // Transition time is on local time, so we need to add the UTC offset to get the correct UTC timestamp
-    // for the transition.
-    year_epoch_seconds + i64::from(days) * 86400 + transition_date.time.0 - offset.0
 }
 
 /// Resolve the footer of a tzif file.
