@@ -214,6 +214,75 @@ pub(crate) fn calculate_transition_seconds_for_year(
     year_epoch_seconds + i64::from(days) * 86400 + transition_time_seconds - offset.0
 }
 
+pub(crate) fn resolve_posix_epoch_seconds(
+    start: (PosixTransitionDay, i64),
+    end: (PosixTransitionDay, i64),
+    std_offset: UtcOffsetSeconds,
+    dst_offset: UtcOffsetSeconds,
+    epoch_seconds: i64,
+) -> TimeZoneTransitionInfo {
+    let year = utils::epoch_time_to_iso_year(epoch_seconds * 1000);
+
+    let dst_start_seconds =
+        calculate_transition_seconds_for_year(year, start.0, start.1, std_offset);
+    let dst_end_seconds = calculate_transition_seconds_for_year(year, end.0, end.1, dst_offset);
+
+    // Need to determine if the range being tested is standard or savings time.
+    let dst_is_inversed = dst_end_seconds < dst_start_seconds;
+
+    // We have potentially to different variations of the DST start and end time.
+    //
+    // Northern hemisphere: dst_start -> dst_end
+    // Southern hemisphere: dst_end -> dst_start
+    //
+    // This is primarily due to the summer / winter months of those areas.
+    //
+    // For the northern hemispere, we can check if the range contains the seconds. For the
+    // southern hemisphere, we check if the range does no contain the value.
+    let should_return_dst = (!dst_is_inversed
+        && (dst_start_seconds..dst_end_seconds).contains(&epoch_seconds))
+        || (dst_is_inversed && !(dst_end_seconds..dst_start_seconds).contains(&epoch_seconds));
+
+    // Expanding on the above, the state of time zones in the year are:
+    //
+    // Northern hemisphere: STD -> DST -> STD
+    // Southern hemisphere: DST -> STD -> DST
+    //
+    // This is simple for the returning the offsets, but if the seconds value falls into the first
+    // available rule. However, the northern hemisphere's first STD rule and the Southern hemisphere's
+    // first DST rule will have different transition times that are based in the year prior, so if the
+    // requested seconds falls in that range, we calculate the transition time for the prior year.
+    let (new_offset, transition_epoch) = if should_return_dst {
+        let transition_epoch = if dst_is_inversed && epoch_seconds < dst_end_seconds {
+            Some(calculate_transition_seconds_for_year(
+                year - 1,
+                start.0,
+                start.1,
+                dst_offset,
+            ))
+        } else {
+            Some(dst_start_seconds)
+        };
+        (dst_offset, transition_epoch)
+    } else {
+        let transition_epoch = if !dst_is_inversed && epoch_seconds < dst_start_seconds {
+            Some(calculate_transition_seconds_for_year(
+                year - 1,
+                end.0,
+                end.1,
+                std_offset,
+            ))
+        } else {
+            Some(dst_end_seconds)
+        };
+        (std_offset, transition_epoch)
+    };
+    TimeZoneTransitionInfo {
+        offset: new_offset,
+        transition_epoch,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransitionType {
     Dst,

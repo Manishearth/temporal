@@ -32,8 +32,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::common::{
-    calculate_transition_seconds_for_year, offset_range, DstTransitionInfoForYear,
-    LocalTimeRecordResult, Mwd, MwdForTime, TimeZoneTransitionInfo, TransitionKind, TransitionType,
+    offset_range, resolve_posix_epoch_seconds, DstTransitionInfoForYear, LocalTimeRecordResult,
+    Mwd, MwdForTime, TimeZoneTransitionInfo, TransitionKind, TransitionType,
 };
 use crate::provider::EpochNanosecondsAndOffset;
 use crate::CompiledNormalizer;
@@ -779,66 +779,16 @@ fn resolve_posix_tz_string_for_epoch_seconds(
         });
     };
 
-    let year = utils::epoch_time_to_iso_year(seconds * 1000);
-
-    let transition_info = DstTransitionInfoForYear::compute(posix_tz_string, dst_variant, year);
-    let dst_start_seconds = transition_info.dst_start_seconds;
-    let dst_end_seconds = transition_info.dst_end_seconds;
-
-    // Need to determine if the range being tested is standard or savings time.
-    let dst_is_inversed = dst_end_seconds < dst_start_seconds;
-
-    // We have potentially to different variations of the DST start and end time.
-    //
-    // Northern hemisphere: dst_start -> dst_end
-    // Southern hemisphere: dst_end -> dst_start
-    //
-    // This is primarily due to the summer / winter months of those areas.
-    //
-    // For the northern hemispere, we can check if the range contains the seconds. For the
-    // southern hemisphere, we check if the range does no contain the value.
-    let should_return_dst = (!dst_is_inversed
-        && (dst_start_seconds..dst_end_seconds).contains(&seconds))
-        || (dst_is_inversed && !(dst_end_seconds..dst_start_seconds).contains(&seconds));
-
-    // Expanding on the above, the state of time zones in the year are:
-    //
-    // Northern hemisphere: STD -> DST -> STD
-    // Southern hemisphere: DST -> STD -> DST
-    //
-    // This is simple for the returning the offsets, but if the seconds value falls into the first
-    // available rule. However, the northern hemisphere's first STD rule and the Southern hemisphere's
-    // first DST rule will have different transition times that are based in the year prior, so if the
-    // requested seconds falls in that range, we calculate the transition time for the prior year.
-    let (new_offset, transition_epoch) = if should_return_dst {
-        let transition_epoch = if dst_is_inversed && seconds < dst_end_seconds {
-            Some(calculate_transition_seconds_for_year(
-                year - 1,
-                dst_variant.start_date.day.into(),
-                dst_variant.start_date.time.0,
-                transition_info.dst_offset,
-            ))
-        } else {
-            Some(dst_start_seconds)
-        };
-        (transition_info.dst_offset, transition_epoch)
-    } else {
-        let transition_epoch = if !dst_is_inversed && seconds < dst_start_seconds {
-            Some(calculate_transition_seconds_for_year(
-                year - 1,
-                dst_variant.end_date.day.into(),
-                dst_variant.end_date.time.0,
-                transition_info.std_offset,
-            ))
-        } else {
-            Some(dst_end_seconds)
-        };
-        (transition_info.std_offset, transition_epoch)
-    };
-    Ok(TimeZoneTransitionInfo {
-        offset: new_offset,
-        transition_epoch,
-    })
+    Ok(resolve_posix_epoch_seconds(
+        (
+            dst_variant.start_date.day.into(),
+            dst_variant.start_date.time.0,
+        ),
+        (dst_variant.end_date.day.into(), dst_variant.end_date.time.0),
+        UtcOffsetSeconds::from(&posix_tz_string.std_info),
+        UtcOffsetSeconds::from(&dst_variant.variant_info),
+        seconds,
+    ))
 }
 
 /// Resolve the footer of a tzif file.

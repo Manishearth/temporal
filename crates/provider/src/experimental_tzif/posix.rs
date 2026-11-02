@@ -1,8 +1,8 @@
 use crate::{
     common::{
-        calculate_transition_seconds_for_year, offset_range, DstTransitionInfoForYear,
-        LocalTimeRecordResult, Mwd, MwdForTime, PosixTransitionDay, TimeZoneTransitionInfo,
-        TransitionType,
+        calculate_transition_seconds_for_year, offset_range, resolve_posix_epoch_seconds,
+        DstTransitionInfoForYear, LocalTimeRecordResult, Mwd, MwdForTime, PosixTransitionDay,
+        TimeZoneTransitionInfo, TransitionType,
     },
     epoch_nanoseconds::EpochNanoseconds,
     provider::{GapEntryOffsets, TimeZoneProviderResult, UtcOffsetSeconds},
@@ -113,70 +113,19 @@ impl PosixZone {
             });
         };
 
-        let year = utils::epoch_time_to_iso_year(epoch_seconds * 1000);
-
-        let transition_info = DstTransitionInfoForYear::compute_zero_transition(
-            self.offset,
-            dst_transition_info,
-            year,
-        )?;
-        let dst_start_seconds = transition_info.dst_start_seconds;
-        let dst_end_seconds = transition_info.dst_end_seconds;
-
-        // Need to determine if the range being tested is standard or savings time.
-        let dst_is_inversed = dst_end_seconds < dst_start_seconds;
-
-        // We have potentially to different variations of the DST start and end time.
-        //
-        // Northern hemisphere: dst_start -> dst_end
-        // Southern hemisphere: dst_end -> dst_start
-        //
-        // This is primarily due to the summer / winter months of those areas.
-        //
-        // For the northern hemispere, we can check if the range contains the seconds. For the
-        // southern hemisphere, we check if the range does no contain the value.
-        let should_return_dst = (!dst_is_inversed
-            && (dst_start_seconds..dst_end_seconds).contains(&epoch_seconds))
-            || (dst_is_inversed && !(dst_end_seconds..dst_start_seconds).contains(&epoch_seconds));
-
-        // Expanding on the above, the state of time zones in the year are:
-        //
-        // Northern hemisphere: STD -> DST -> STD
-        // Southern hemisphere: DST -> STD -> DST
-        //
-        // This is simple for the returning the offsets, but if the seconds value falls into the first
-        // available rule. However, the northern hemisphere's first STD rule and the Southern hemisphere's
-        // first DST rule will have different transition times that are based in the year prior, so if the
-        // requested seconds falls in that range, we calculate the transition time for the prior year.
-        let (new_offset, transition_epoch) = if should_return_dst {
-            let transition_epoch = if dst_is_inversed && epoch_seconds < dst_end_seconds {
-                Some(calculate_transition_seconds_for_year(
-                    year - 1,
-                    dst_transition_info.start.date.to_posix_day()?,
-                    dst_transition_info.start.time,
-                    transition_info.dst_offset,
-                ))
-            } else {
-                Some(dst_start_seconds)
-            };
-            (transition_info.dst_offset, transition_epoch)
-        } else {
-            let transition_epoch = if !dst_is_inversed && epoch_seconds < dst_start_seconds {
-                Some(calculate_transition_seconds_for_year(
-                    year - 1,
-                    dst_transition_info.end.date.to_posix_day()?,
-                    dst_transition_info.end.time,
-                    transition_info.std_offset,
-                ))
-            } else {
-                Some(dst_end_seconds)
-            };
-            (transition_info.std_offset, transition_epoch)
-        };
-        Ok(TimeZoneTransitionInfo {
-            offset: new_offset,
-            transition_epoch,
-        })
+        Ok(resolve_posix_epoch_seconds(
+            (
+                dst_transition_info.start.date.to_posix_day()?,
+                dst_transition_info.start.time,
+            ),
+            (
+                dst_transition_info.end.date.to_posix_day()?,
+                dst_transition_info.end.time,
+            ),
+            UtcOffsetSeconds(self.offset),
+            UtcOffsetSeconds(self.offset + dst_transition_info.savings),
+            epoch_seconds,
+        ))
     }
 }
 
