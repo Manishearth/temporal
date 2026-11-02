@@ -32,8 +32,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::common::{
-    resolve_posix_epoch_seconds, resolve_posix_local_seconds, DstTransitionInfoForYear,
-    LocalTimeRecordResult, TimeZoneTransitionInfo, TransitionKind,
+    resolve_posix_epoch_seconds, DstTransitionInfoForYear, LocalTimeRecordResult,
+    TimeZoneTransitionInfo, TransitionKind,
 };
 use crate::provider::EpochNanosecondsAndOffset;
 use crate::CompiledNormalizer;
@@ -799,19 +799,18 @@ fn resolve_posix_tz_string(
     posix_tz_string: &PosixTzString,
     seconds: i64,
 ) -> TimeZoneProviderResult<LocalTimeRecordResult> {
-    let std = &posix_tz_string.std_info;
     let Some(dst) = &posix_tz_string.dst_info else {
         // Regardless of the time, there is one variant and we can return it.
         return Ok(UtcOffsetSeconds::from(&posix_tz_string.std_info).into());
     };
 
-    resolve_posix_local_seconds(
-        (dst.start_date.day.into(), dst.start_date.time.0),
-        (dst.end_date.day.into(), dst.end_date.time.0),
-        UtcOffsetSeconds::from(std),
-        UtcOffsetSeconds::from(&dst.variant_info),
-        seconds,
-    )
+    DstTransitionInfoForYear::resolve_local_seconds(seconds, |year| {
+        Ok(DstTransitionInfoForYear::compute(
+            posix_tz_string,
+            dst,
+            year,
+        ))
+    })
 }
 
 /// Timezone provider that uses compiled data.

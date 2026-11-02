@@ -3,10 +3,10 @@
 use crate::{
     epoch_nanoseconds::EpochNanoseconds,
     provider::{GapEntryOffsets, TimeZoneProviderResult, UtcOffsetSeconds},
-    utils, TimeZoneProviderError,
+    utils,
 };
 
-use core::ops::Range;
+use core::{cmp::Ordering, ops::Range};
 
 #[cfg(feature = "tzif")]
 use tzif::data::{
@@ -86,6 +86,59 @@ impl From<TransitionDay> for PosixTransitionDay {
     }
 }
 
+/// A single resolved POSIX transition with its UTC epoch timestamp and surrounding offsets.
+#[derive(Debug, Clone, Copy)]
+struct PosixTransition {
+    /// Offset in effect before this transition.
+    prev: UtcOffsetSeconds,
+    /// Offset in effect at and after this transition.
+    next: UtcOffsetSeconds,
+    /// UTC epoch seconds at which the transition occurs.
+    transition_time: i64,
+}
+
+impl PosixTransition {
+    fn prev_local(&self) -> i64 {
+        self.transition_time + self.prev.0
+    }
+
+    fn next_local(&self) -> i64 {
+        self.transition_time + self.next.0
+    }
+
+    fn kind(&self) -> TransitionKind {
+        match self.prev.0.cmp(&self.next.0) {
+            Ordering::Less => TransitionKind::Gap,
+            Ordering::Greater => TransitionKind::Overlap,
+            Ordering::Equal => TransitionKind::Smooth,
+        }
+    }
+
+    fn offset_range_local(&self) -> Range<i64> {
+        let prev = self.prev_local();
+        let next = self.next_local();
+        match self.kind() {
+            TransitionKind::Overlap => next..prev,
+            _ => prev..next,
+        }
+    }
+
+    fn record_for_contains(&self) -> LocalTimeRecordResult {
+        match self.kind() {
+            TransitionKind::Gap => LocalTimeRecordResult::Empty(GapEntryOffsets {
+                offset_before: self.prev,
+                offset_after: self.next,
+                transition_epoch: EpochNanoseconds::from_seconds(self.transition_time),
+            }),
+            TransitionKind::Overlap => LocalTimeRecordResult::Ambiguous {
+                first: self.prev,
+                second: self.next,
+            },
+            TransitionKind::Smooth => LocalTimeRecordResult::Single(self.prev),
+        }
+    }
+}
+
 /// Stores the information about DST transitions for a given year
 pub(crate) struct DstTransitionInfoForYear {
     pub(crate) dst_start_seconds: i64,
@@ -95,6 +148,10 @@ pub(crate) struct DstTransitionInfoForYear {
 }
 
 impl DstTransitionInfoForYear {
+    /// Maximum seconds a POSIX transition (time in `-167:59:59..=+167:59:59` plus max UTC offset
+    /// difference) could spill across an ISO year boundary. 15 days is a generous upper bound.
+    const BOUNDARY_WINDOW_SECONDS: i64 = 15 * 86_400;
+
     #[cfg(feature = "tzif")]
     pub(crate) fn compute(
         posix_tz_string: &PosixTzString,
@@ -140,6 +197,88 @@ impl DstTransitionInfoForYear {
         } else {
             self.std_offset
         }
+    }
+
+    /// Returns this year's two transitions in chronological UTC order.
+    fn ordered_transitions(&self) -> (PosixTransition, PosixTransition) {
+        let start = PosixTransition {
+            prev: self.std_offset,
+            next: self.dst_offset,
+            transition_time: self.dst_start_seconds,
+        };
+        let end = PosixTransition {
+            prev: self.dst_offset,
+            next: self.std_offset,
+            transition_time: self.dst_end_seconds,
+        };
+        if self.dst_start_seconds <= self.dst_end_seconds {
+            (start, end)
+        } else {
+            (end, start)
+        }
+    }
+
+    /// Resolves the candidate local time record(s) for `local_seconds` (wall-clock seconds since
+    /// `1970-01-01T00:00:00`) using `compute_for_year` to compute POSIX transitions per year.
+    pub(crate) fn resolve_local_seconds(
+        local_seconds: i64,
+        compute_for_year: impl Fn(i32) -> TimeZoneProviderResult<Self>,
+    ) -> TimeZoneProviderResult<LocalTimeRecordResult> {
+        let year = utils::epoch_time_to_iso_year(local_seconds * 1_000);
+        let (first, second) = compute_for_year(year)?.ordered_transitions();
+        let first_range = first.offset_range_local();
+
+        if local_seconds < first_range.start {
+            let year_start_seconds = i64::from(utils::epoch_days_for_year(year)) * 86_400;
+            if local_seconds - year_start_seconds < Self::BOUNDARY_WINDOW_SECONDS {
+                let (prev_first, prev_second) = compute_for_year(year - 1)?.ordered_transitions();
+                let prev_second_range = prev_second.offset_range_local();
+                if prev_second_range.contains(&local_seconds) {
+                    return Ok(prev_second.record_for_contains());
+                } else if local_seconds < prev_second_range.start {
+                    let prev_first_range = prev_first.offset_range_local();
+                    if prev_first_range.contains(&local_seconds) {
+                        return Ok(prev_first.record_for_contains());
+                    } else if local_seconds < prev_first_range.start {
+                        return Ok(LocalTimeRecordResult::Single(prev_first.prev));
+                    }
+                    return Ok(LocalTimeRecordResult::Single(prev_second.prev));
+                }
+            }
+            return Ok(LocalTimeRecordResult::Single(first.prev));
+        }
+
+        if first_range.contains(&local_seconds) {
+            return Ok(first.record_for_contains());
+        }
+
+        let second_range = second.offset_range_local();
+        if local_seconds < second_range.start {
+            return Ok(LocalTimeRecordResult::Single(first.next));
+        }
+
+        if second_range.contains(&local_seconds) {
+            return Ok(second.record_for_contains());
+        }
+
+        let next_year_start_seconds = i64::from(utils::epoch_days_for_year(year + 1)) * 86_400;
+        if next_year_start_seconds - local_seconds < Self::BOUNDARY_WINDOW_SECONDS {
+            let (next_first, next_second) = compute_for_year(year + 1)?.ordered_transitions();
+            let next_first_range = next_first.offset_range_local();
+            if next_first_range.contains(&local_seconds) {
+                return Ok(next_first.record_for_contains());
+            } else if local_seconds >= next_first_range.end {
+                let next_second_range = next_second.offset_range_local();
+                if next_second_range.contains(&local_seconds) {
+                    return Ok(next_second.record_for_contains());
+                } else if local_seconds >= next_second_range.end {
+                    return Ok(LocalTimeRecordResult::Single(next_second.next));
+                }
+                return Ok(LocalTimeRecordResult::Single(next_first.next));
+            }
+        }
+
+        Ok(LocalTimeRecordResult::Single(second.next))
     }
 }
 
@@ -284,271 +423,6 @@ pub(crate) fn resolve_posix_epoch_seconds(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransitionType {
-    Dst,
-    Std,
-}
-
-impl TransitionType {
-    fn invert(&mut self) {
-        *self = match *self {
-            Self::Dst => Self::Std,
-            Self::Std => Self::Dst,
-        }
-    }
-}
-
-/// The month, week of month, and day of week value built into the POSIX tz string.
-///
-/// For more information, see the [POSIX tz string docs](https://sourceware.org/glibc/manual/2.40/html_node/Proleptic-TZ.html)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Mwd {
-    month: u8,
-    week: u8,
-    day: u8,
-}
-
-impl Mwd {
-    fn from_u16(month: u16, week: u16, day: u16) -> Self {
-        Self::from_u8(
-            u8::try_from(month).unwrap_or(0),
-            u8::try_from(week).unwrap_or(0),
-            u8::try_from(day).unwrap_or(0),
-        )
-    }
-
-    fn from_u8(month: u8, week: u8, day: u8) -> Self {
-        Self { month, week, day }
-    }
-
-    /// Given the day of the week of the 0th day in this month,
-    /// normalize the week to being a week number (1 = first week, ...)
-    /// rather than a weekday ordinal (1 = first friday, etc)
-    pub(crate) fn normalize_to_week_number(&mut self, day_of_week_zeroth_day: u8) {
-        if self.day <= day_of_week_zeroth_day {
-            self.week += 1;
-        }
-    }
-}
-
-/// Represents an MWD for a given time
-#[derive(Debug)]
-pub(crate) struct MwdForTime {
-    /// This will never have day = 5
-    pub(crate) mwd: Mwd,
-    /// The day of the week of the 0th day (the day before the month starts)
-    pub(crate) day_of_week_zeroth_day: u8,
-    /// This is the day of week of the 29th and the last day of the month,
-    /// if the month has more than 28 days.
-    /// Basically, this is the start and end of the "fifth $weekday of the month" period
-    pub(crate) extra_days: Option<(u8, u8)>,
-}
-
-impl MwdForTime {
-    #[cfg(any(feature = "tzif", feature = "experimental_tzif"))]
-    pub(crate) fn from_seconds(seconds: i64) -> Self {
-        let (year, month, day_of_month) = utils::ymd_from_epoch_milliseconds(seconds * 1_000);
-        let week_of_month = (day_of_month - 1) / 7 + 1;
-        let day_of_week = utils::epoch_seconds_to_day_of_week(seconds);
-        let mut mwd = Mwd::from_u8(month, week_of_month, day_of_week);
-        let days_in_month = utils::iso_days_in_month(year, month);
-        let day_of_week_zeroth_day =
-            (i16::from(day_of_week) - i16::from(day_of_month)).rem_euclid(7) as u8;
-        mwd.normalize_to_week_number(day_of_week_zeroth_day);
-        if days_in_month > 28 {
-            let day_of_week_day_29 = (day_of_week_zeroth_day + 29).rem_euclid(7);
-            let day_of_week_last_day = (day_of_week_zeroth_day + days_in_month).rem_euclid(7);
-            Self {
-                mwd,
-                day_of_week_zeroth_day,
-                extra_days: Some((day_of_week_day_29, day_of_week_last_day)),
-            }
-        } else {
-            // No day 5
-            Self {
-                mwd,
-                day_of_week_zeroth_day,
-                extra_days: None,
-            }
-        }
-    }
-
-    /// MWDs from Posix data can contain `w=5`, which means the *last* $weekday of the month,
-    /// not the 5th. For MWDs in the same month, this normalizes the 5 to the actual number of the
-    /// last weekday of the month (5 or 4)
-    ///
-    /// Furthermore, this turns the week number into a true week number: the "second friday in March"
-    /// will be turned into "the friday in the first week of March" or "the Friday in the second week of March"
-    /// depending on when March starts.
-    ///
-    /// This normalization *only* applies to MWDs in the same month. For other MWDs, such normalization is irrelevant.
-    pub(crate) fn normalize_mwd(&self, other: &mut Mwd) {
-        // If we're in the same month, normalization will actually have a useful effect
-        if self.mwd.month == other.month {
-            // First normalize MWDs that are like "the last $weekday in the month"
-            // the last $weekday in the month, we need special handling
-            if other.week == 5 {
-                if let Some((day_29, last_day)) = self.extra_days {
-                    if day_29 <= last_day {
-                        if other.day < day_29 || other.day > last_day {
-                            // This day isn't found in the last week. Subtract one.
-                            other.week = 4;
-                        }
-                    } else {
-                        // The extra part of the month crosses Sunday
-                        if other.day < day_29 && other.day > last_day {
-                            // This day isn't found in the last week. Subtract one.
-                            other.week = 4;
-                        }
-                    }
-                } else {
-                    // There is no week 5 in this month, normalize to 4
-                    other.week = 4;
-                }
-            }
-
-            other.normalize_to_week_number(self.day_of_week_zeroth_day);
-        }
-    }
-}
-
-fn offset_range(offset_one: i64, offset_two: i64) -> core::ops::Range<i64> {
-    if offset_one < offset_two {
-        return offset_one..offset_two;
-    }
-    offset_two..offset_one
-}
-
-pub(crate) fn resolve_posix_local_seconds(
-    start: (PosixTransitionDay, i64),
-    end: (PosixTransitionDay, i64),
-    std: UtcOffsetSeconds,
-    dst: UtcOffsetSeconds,
-    local_seconds: i64,
-) -> TimeZoneProviderResult<LocalTimeRecordResult> {
-    // TODO: Resolve safety issue around utils.
-    //   Using f64 is a hold over from early implementation days and should
-    //   be moved away from.
-
-    // NOTE:
-    // STD -> DST == start
-    // DST -> STD == end
-    let (is_transition_day, mut is_dst) =
-        cmp_seconds_to_transitions(start.0, end.0, local_seconds)?;
-    if is_transition_day {
-        let time = utils::epoch_ms_to_ms_in_day(local_seconds * 1_000) as i64 / 1_000;
-        let transition_time = if is_dst == TransitionType::Dst {
-            start.1
-        } else {
-            end.1
-        };
-        let transition_diff = if is_dst == TransitionType::Dst {
-            dst.0 - std.0
-        } else {
-            std.0 - dst.0
-        };
-        let offset = offset_range(transition_time + transition_diff, transition_time);
-        match offset.contains(&time) {
-            true if is_dst == TransitionType::Dst => {
-                return Ok(LocalTimeRecordResult::Empty(GapEntryOffsets {
-                    offset_before: std,
-                    offset_after: dst,
-                    transition_epoch: EpochNanoseconds::from_seconds(transition_time),
-                }));
-            }
-            true => {
-                // Note(nekevss, manishearth): We may need to more carefully
-                // handle inverse DST here.
-                return Ok(LocalTimeRecordResult::Ambiguous {
-                    first: dst,
-                    second: std,
-                });
-            }
-            _ => {}
-        }
-
-        // We were not contained in the transition above,
-        // AND we are before it, which means we are actually in
-        // the other transition!
-        //
-        // NOTE(Manishearth) do we need to do anything special
-        // here if we end up back at the tzif transition data?
-        if time < offset.start {
-            is_dst.invert();
-        }
-    }
-
-    match is_dst {
-        TransitionType::Dst => Ok(dst.into()),
-        TransitionType::Std => Ok(std.into()),
-    }
-}
-
-fn cmp_seconds_to_transitions(
-    start: PosixTransitionDay,
-    end: PosixTransitionDay,
-    seconds: i64,
-) -> TimeZoneProviderResult<(bool, TransitionType)> {
-    let cmp_result = match (start, end) {
-        (
-            PosixTransitionDay::Mwd(start_month, start_week, start_day),
-            PosixTransitionDay::Mwd(end_month, end_week, end_day),
-        ) => {
-            let mwd = MwdForTime::from_seconds(seconds);
-            let mut start = Mwd::from_u16(start_month, start_week, start_day);
-            let mut end = Mwd::from_u16(end_month, end_week, end_day);
-
-            mwd.normalize_mwd(&mut start);
-            mwd.normalize_mwd(&mut end);
-
-            let is_transition = start == mwd.mwd || end == mwd.mwd;
-            let is_dst = if start > end {
-                mwd.mwd < end || start <= mwd.mwd
-            } else {
-                start <= mwd.mwd && mwd.mwd < end
-            };
-
-            (is_transition, is_dst)
-        }
-        (PosixTransitionDay::JulianWithLeap(start), PosixTransitionDay::JulianWithLeap(end)) => {
-            let day_in_year = utils::epoch_time_to_day_in_year(seconds * 1_000) as u16;
-            let is_transition = start == day_in_year || end == day_in_year;
-            let is_dst = if start > end {
-                day_in_year < end || start <= day_in_year
-            } else {
-                start <= day_in_year && day_in_year < end
-            };
-            (is_transition, is_dst)
-        }
-        // TODO: do we need to modify the logic for leap years?
-        (PosixTransitionDay::JulianNoLeap(start), PosixTransitionDay::JulianNoLeap(end)) => {
-            let day_in_year = utils::epoch_time_to_day_in_year(seconds * 1_000) as u16;
-            let is_transition = start == day_in_year || end == day_in_year;
-            let is_dst = if start > end {
-                day_in_year < end || start <= day_in_year
-            } else {
-                start <= day_in_year && day_in_year < end
-            };
-            (is_transition, is_dst)
-        }
-        // NOTE: The assumption here is that mismatched day types on
-        // a POSIX string is an illformed string.
-        _ => {
-            return Err(TimeZoneProviderError::Assert(
-                "Mismatched day types on a POSIX string.",
-            ))
-        }
-    };
-
-    match cmp_result {
-        (true, dst) if dst => Ok((true, TransitionType::Dst)),
-        (true, _) => Ok((true, TransitionType::Std)),
-        (false, dst) if dst => Ok((false, TransitionType::Dst)),
-        (false, _) => Ok((false, TransitionType::Std)),
-    }
-}
-
 #[derive(Debug)]
 pub(crate) enum TransitionKind {
     // The offsets didn't change (happens when abbreviations/savings values change)
@@ -558,46 +432,45 @@ pub(crate) enum TransitionKind {
     // The offsets changed in a way that produces overlapping time.
     Overlap,
 }
-#[cfg(all(test, any(feature = "tzif", feature = "experimental_tzif")))]
+
+#[cfg(test)]
 mod tests {
-    use super::{Mwd, MwdForTime};
-    use crate::utils;
+    use super::{
+        calculate_transition_seconds_for_year, DstTransitionInfoForYear, LocalTimeRecordResult,
+        PosixTransitionDay,
+    };
+    use crate::{
+        epoch_nanoseconds::EpochNanoseconds,
+        provider::{GapEntryOffsets, UtcOffsetSeconds},
+        utils,
+    };
 
-    #[test]
-    fn mwd_ordering_matches_calendar_days_across_solar_cycle() {
-        // A 28-year solar cycle (2000..=2027) covers all 7 starting weekdays for
-        // 28-, 29-, 30-, and 31-day months (including leap-year Februaries).
-        for year in 2000..=2027 {
-            for month in 1..=12u8 {
-                let days_in_month = utils::iso_days_in_month(year, month);
-                let first_day_secs = utils::epoch_days_from_gregorian_date(year, month, 1) * 86_400;
-                let first_dow = utils::epoch_seconds_to_day_of_week(first_day_secs);
+    fn local_secs(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> i64 {
+        let epoch_days = utils::epoch_days_from_gregorian_date(year, month, day);
+        epoch_days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second)
+    }
 
-                for rule_week in 1..=5u8 {
-                    for rule_day in 0..=6u8 {
-                        let first_occurrence = 1 + (rule_day + 7 - first_dow) % 7;
-                        let mut transition_dom = first_occurrence + (rule_week - 1) * 7;
-                        if transition_dom > days_in_month {
-                            transition_dom -= 7;
-                        }
-
-                        for dom in 1..=days_in_month {
-                            let secs = utils::epoch_days_from_gregorian_date(year, month, dom)
-                                * 86_400
-                                + 43_200;
-                            let mwd = MwdForTime::from_seconds(secs);
-                            let mut rule = Mwd::from_u8(month, rule_week, rule_day);
-                            mwd.normalize_mwd(&mut rule);
-
-                            assert_eq!(
-                                mwd.mwd.cmp(&rule),
-                                dom.cmp(&transition_dom),
-                                "mismatch for {year}-{month:02}-{dom:02} vs M{month}.{rule_week}.{rule_day} (transition day {transition_dom})"
-                            );
-                        }
-                    }
-                }
-            }
+    #[allow(clippy::too_many_arguments)]
+    fn make_year_info(
+        year: i32,
+        std_offset: i64,
+        dst_offset: i64,
+        start_day: PosixTransitionDay,
+        start_time: i64,
+        end_day: PosixTransitionDay,
+        end_time: i64,
+    ) -> DstTransitionInfoForYear {
+        let std_offset = UtcOffsetSeconds(std_offset);
+        let dst_offset = UtcOffsetSeconds(dst_offset);
+        DstTransitionInfoForYear {
+            dst_start_seconds: calculate_transition_seconds_for_year(
+                year, start_day, start_time, std_offset,
+            ),
+            dst_end_seconds: calculate_transition_seconds_for_year(
+                year, end_day, end_time, dst_offset,
+            ),
+            std_offset,
+            dst_offset,
         }
     }
 
@@ -612,5 +485,189 @@ mod tests {
         assert_eq!(utils::epoch_seconds_to_day_of_week(-86_400), 3);
         // 1969-12-30T23:59:59Z is Tuesday (2)
         assert_eq!(utils::epoch_seconds_to_day_of_week(-86_401), 2);
+    }
+
+    #[test]
+    fn leap_february_last_weekday_rule() {
+        // Synthetic rule: UTC+0 -> UTC+1 on last Sunday of Feb (M2.5.0/2) to M10.5.0/3.
+        // In 2024 (leap year, Feb has 29 days, Feb 29 is Thursday), the last Sunday of Feb is
+        // Feb 25 (4th Sunday), whereas the last Thursday (M2.5.4) is Feb 29 (5th Thursday).
+        let resolve_sun = |secs| {
+            DstTransitionInfoForYear::resolve_local_seconds(secs, |y| {
+                Ok(make_year_info(
+                    y,
+                    0,
+                    3_600,
+                    PosixTransitionDay::Mwd(2, 5, 0),
+                    7_200,
+                    PosixTransitionDay::Mwd(10, 5, 0),
+                    10_800,
+                ))
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            resolve_sun(local_secs(2024, 2, 24, 12, 0, 0)),
+            LocalTimeRecordResult::Single(UtcOffsetSeconds(0))
+        );
+        assert!(matches!(
+            resolve_sun(local_secs(2024, 2, 25, 2, 30, 0)),
+            LocalTimeRecordResult::Empty(_)
+        ));
+        assert_eq!(
+            resolve_sun(local_secs(2024, 2, 26, 12, 0, 0)),
+            LocalTimeRecordResult::Single(UtcOffsetSeconds(3_600))
+        );
+
+        let resolve_thu = |secs| {
+            DstTransitionInfoForYear::resolve_local_seconds(secs, |y| {
+                Ok(make_year_info(
+                    y,
+                    0,
+                    3_600,
+                    PosixTransitionDay::Mwd(2, 5, 4),
+                    7_200,
+                    PosixTransitionDay::Mwd(10, 5, 0),
+                    10_800,
+                ))
+            })
+            .unwrap()
+        };
+        // 4th Thursday (Feb 22) is still STD; 5th Thursday (Feb 29) has the gap.
+        assert_eq!(
+            resolve_thu(local_secs(2024, 2, 22, 12, 0, 0)),
+            LocalTimeRecordResult::Single(UtcOffsetSeconds(0))
+        );
+        assert_eq!(
+            resolve_thu(local_secs(2024, 2, 28, 12, 0, 0)),
+            LocalTimeRecordResult::Single(UtcOffsetSeconds(0))
+        );
+        assert!(matches!(
+            resolve_thu(local_secs(2024, 2, 29, 2, 30, 0)),
+            LocalTimeRecordResult::Empty(_)
+        ));
+    }
+
+    #[test]
+    fn inverse_dst_and_gap_transition_epoch() {
+        // Rearguard Ireland POSIX rule: IST-1GMT0,M10.5.0,M3.5.0/1
+        // std_offset = +3600 (IST), dst_offset = 0 (GMT).
+        // Start in Oct falls back (+3600 -> 0, Overlap), End in Mar springs forward (0 -> +3600, Gap).
+        let compute = |y| {
+            Ok(make_year_info(
+                y,
+                3_600,
+                0,
+                PosixTransitionDay::Mwd(10, 5, 0),
+                7_200,
+                PosixTransitionDay::Mwd(3, 5, 0),
+                3_600,
+            ))
+        };
+
+        // 2026-03-29 01:30 local is in the spring-forward gap (01:00 -> 02:00)
+        let mar_gap = DstTransitionInfoForYear::resolve_local_seconds(
+            local_secs(2026, 3, 29, 1, 30, 0),
+            compute,
+        )
+        .unwrap();
+        assert_eq!(
+            mar_gap,
+            LocalTimeRecordResult::Empty(GapEntryOffsets {
+                offset_before: UtcOffsetSeconds(0),
+                offset_after: UtcOffsetSeconds(3_600),
+                transition_epoch: EpochNanoseconds::from_seconds(local_secs(2026, 3, 29, 1, 0, 0)),
+            })
+        );
+
+        // 2026-10-25 01:30 local is in the fall-back overlap (IST +1 first, GMT 0 second)
+        let oct_overlap = DstTransitionInfoForYear::resolve_local_seconds(
+            local_secs(2026, 10, 25, 1, 30, 0),
+            compute,
+        )
+        .unwrap();
+        assert_eq!(
+            oct_overlap,
+            LocalTimeRecordResult::Ambiguous {
+                first: UtcOffsetSeconds(3_600),
+                second: UtcOffsetSeconds(0),
+            }
+        );
+    }
+
+    #[test]
+    fn year_boundary_spillover_and_epoch_transition_accuracy() {
+        // Rule with transition spilling into next year: J60/2 .. J365/50 (Dec 31 + 50h = Jan 2 02:00)
+        let compute_spill_forward = |y| {
+            Ok(make_year_info(
+                y,
+                0,
+                3_600,
+                PosixTransitionDay::JulianNoLeap(60),
+                7_200,
+                PosixTransitionDay::JulianNoLeap(365),
+                50 * 3_600,
+            ))
+        };
+        // 2026-01-01 12:00 is still in 2025's DST because 2025's end transition is 2026-01-02 02:00!
+        assert_eq!(
+            DstTransitionInfoForYear::resolve_local_seconds(
+                local_secs(2026, 1, 1, 12, 0, 0),
+                compute_spill_forward,
+            )
+            .unwrap(),
+            LocalTimeRecordResult::Single(UtcOffsetSeconds(3_600))
+        );
+        // 2026-01-02 01:30 is in the 02:00 -> 01:00 fall-back overlap!
+        assert_eq!(
+            DstTransitionInfoForYear::resolve_local_seconds(
+                local_secs(2026, 1, 2, 1, 30, 0),
+                compute_spill_forward,
+            )
+            .unwrap(),
+            LocalTimeRecordResult::Ambiguous {
+                first: UtcOffsetSeconds(3_600),
+                second: UtcOffsetSeconds(0),
+            }
+        );
+        // 2026-01-02 12:00 is now in STD (0).
+        assert_eq!(
+            DstTransitionInfoForYear::resolve_local_seconds(
+                local_secs(2026, 1, 2, 12, 0, 0),
+                compute_spill_forward,
+            )
+            .unwrap(),
+            LocalTimeRecordResult::Single(UtcOffsetSeconds(0))
+        );
+
+        // Rule with transition spilling back into previous year: J1/-2 (Dec 31 22:00) .. J300/2
+        let compute_spill_back = |y| {
+            Ok(make_year_info(
+                y,
+                0,
+                3_600,
+                PosixTransitionDay::JulianNoLeap(1),
+                -7_200,
+                PosixTransitionDay::JulianNoLeap(300),
+                7_200,
+            ))
+        };
+        // 2025-12-31 22:30 is in 2026's spring-forward gap (22:00 -> 23:00)!
+        assert!(matches!(
+            DstTransitionInfoForYear::resolve_local_seconds(
+                local_secs(2025, 12, 31, 22, 30, 0),
+                compute_spill_back,
+            )
+            .unwrap(),
+            LocalTimeRecordResult::Empty(_)
+        ));
+        assert_eq!(
+            DstTransitionInfoForYear::resolve_local_seconds(
+                local_secs(2025, 12, 31, 23, 30, 0),
+                compute_spill_back,
+            )
+            .unwrap(),
+            LocalTimeRecordResult::Single(UtcOffsetSeconds(3_600))
+        );
     }
 }

@@ -20,19 +20,6 @@ pub fn epoch_days_to_epoch_ms(day: i64, time: i64) -> i64 {
     (day * MS_PER_DAY as i64) + time
 }
 
-/// `EpochTimeToDayNumber`
-///
-/// This equation is the equivalent to `ECMAScript`'s `Date(t)`
-#[cfg(any(feature = "tzif", feature = "experimental_tzif"))]
-pub(crate) fn epoch_time_to_day_number(t: i64) -> i32 {
-    t.div_euclid(MS_PER_DAY as i64) as i32
-}
-
-#[cfg(any(feature = "tzif", feature = "experimental_tzif"))]
-pub(crate) fn epoch_ms_to_ms_in_day(t: i64) -> u32 {
-    (t.rem_euclid(i64::from(MS_PER_DAY))) as u32
-}
-
 // https://tc39.es/proposal-temporal/#eqn-mathematicalinleapyear
 pub(crate) fn is_leap(y: i32) -> bool {
     if y % 4 != 0 {
@@ -89,11 +76,6 @@ pub(crate) fn month_to_day(m: u8, is_leap: bool) -> u16 {
         11 => 334 + leap_day,
         _ => unreachable!(),
     }
-}
-
-#[cfg(any(feature = "tzif", feature = "experimental_tzif"))]
-pub(crate) fn epoch_time_to_day_in_year(t: i64) -> i32 {
-    epoch_time_to_day_number(t) - (epoch_days_for_year(epoch_time_to_iso_year(t)))
 }
 
 #[cfg(any(feature = "tzif", feature = "experimental_tzif"))]

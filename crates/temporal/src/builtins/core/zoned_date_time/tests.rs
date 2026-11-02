@@ -1497,3 +1497,105 @@ fn issue_759_posix_dst_near_transitions() {
         );
     })
 }
+
+#[test]
+fn posix_extended_transition_times_and_midnight_gap() {
+    use crate::{PlainDate, PlainDateTime};
+
+    test_all_providers!(provider: {
+        // Asia/Jerusalem uses M3.4.4/26 (Thursday + 26h = Friday 02:00 -> 03:00).
+        // In 2026, 4th Thursday of March is March 26, so transition is Friday March 27 at 02:00.
+        let jerusalem = TimeZone::try_from_str_with_provider("Asia/Jerusalem", provider).unwrap();
+        let before_gap = PlainDateTime::try_new_iso(2026, 3, 27, 1, 0, 0, 0, 0, 0)
+            .unwrap()
+            .to_zoned_date_time_with_provider(jerusalem, Disambiguation::Compatible, provider)
+            .unwrap();
+        assert_eq!(
+            before_gap.to_string_with_provider(provider).unwrap(),
+            "2026-03-27T01:00:00+02:00[Asia/Jerusalem]"
+        );
+        let in_gap = PlainDateTime::try_new_iso(2026, 3, 27, 2, 30, 0, 0, 0, 0).unwrap();
+        assert!(in_gap
+            .to_zoned_date_time_with_provider(jerusalem, Disambiguation::Reject, provider)
+            .is_err());
+        assert_eq!(
+            in_gap
+                .to_zoned_date_time_with_provider(jerusalem, Disambiguation::Compatible, provider)
+                .unwrap()
+                .to_string_with_provider(provider)
+                .unwrap(),
+            "2026-03-27T03:30:00+03:00[Asia/Jerusalem]"
+        );
+
+        // America/Santiago uses M9.1.6/24 (Saturday 24:00 = Sunday 00:00 -> 01:00) and
+        // M4.1.6/24 (Sunday 00:00 -> Saturday 23:00 overlap).
+        let santiago = TimeZone::try_from_str_with_provider("America/Santiago", provider).unwrap();
+        let santiago_sod = PlainDate::try_new_iso(2026, 9, 6)
+            .unwrap()
+            .to_zoned_date_time_with_provider(santiago, None, provider)
+            .unwrap();
+        assert_eq!(
+            santiago_sod.to_string_with_provider(provider).unwrap(),
+            "2026-09-06T01:00:00-03:00[America/Santiago]"
+        );
+
+        let santiago_overlap = PlainDateTime::try_new_iso(2026, 4, 4, 23, 30, 0, 0, 0, 0).unwrap();
+        assert_eq!(
+            santiago_overlap
+                .to_zoned_date_time_with_provider(santiago, Disambiguation::Earlier, provider)
+                .unwrap()
+                .to_string_with_provider(provider)
+                .unwrap(),
+            "2026-04-04T23:30:00-03:00[America/Santiago]"
+        );
+        assert_eq!(
+            santiago_overlap
+                .to_zoned_date_time_with_provider(santiago, Disambiguation::Later, provider)
+                .unwrap()
+                .to_string_with_provider(provider)
+                .unwrap(),
+            "2026-04-04T23:30:00-04:00[America/Santiago]"
+        );
+
+        // America/Godthab uses M3.5.0/-1 (Sunday 00:00 - 1h = Saturday 23:00 -> Sunday 00:00 gap).
+        let godthab = TimeZone::try_from_str_with_provider("America/Godthab", provider).unwrap();
+        let godthab_gap = PlainDateTime::try_new_iso(2026, 3, 28, 23, 30, 0, 0, 0, 0).unwrap();
+        assert!(godthab_gap
+            .to_zoned_date_time_with_provider(godthab, Disambiguation::Reject, provider)
+            .is_err());
+        assert_eq!(
+            godthab_gap
+                .to_zoned_date_time_with_provider(godthab, Disambiguation::Compatible, provider)
+                .unwrap()
+                .to_string_with_provider(provider)
+                .unwrap(),
+            "2026-03-29T00:30:00-01:00[America/Godthab]"
+        );
+
+        // Africa/Cairo uses M4.5.5/0 (last Friday of April, 00:00 -> 01:00 gap), exercising
+        // get_start_of_day's GapEntryOffsets.transition_epoch on a 00:00 POSIX rule.
+        let cairo = TimeZone::try_from_str_with_provider("Africa/Cairo", provider).unwrap();
+        let cairo_sod = PlainDate::try_new_iso(2026, 4, 24)
+            .unwrap()
+            .to_zoned_date_time_with_provider(cairo, None, provider)
+            .unwrap();
+        assert_eq!(
+            cairo_sod.to_string_with_provider(provider).unwrap(),
+            "2026-04-24T01:00:00+03:00[Africa/Cairo]"
+        );
+    });
+
+    #[cfg(feature = "compiled_data")]
+    {
+        let provider = &*crate::builtins::TZ_PROVIDER;
+        let havana = TimeZone::try_from_str_with_provider("America/Havana", provider).unwrap();
+        let havana_sod = PlainDate::try_new_iso(2026, 3, 8)
+            .unwrap()
+            .to_zoned_date_time_with_provider(havana, None, provider)
+            .unwrap();
+        assert_eq!(
+            havana_sod.to_string_with_provider(provider).unwrap(),
+            "2026-03-08T01:00:00-04:00[America/Havana]"
+        );
+    }
+}
