@@ -118,7 +118,7 @@ impl PosixZone {
             self.offset,
             dst_transition_info,
             year,
-        );
+        )?;
         let dst_start_seconds = transition_info.dst_start_seconds;
         let dst_end_seconds = transition_info.dst_end_seconds;
 
@@ -153,7 +153,7 @@ impl PosixZone {
                     year - 1,
                     dst_transition_info.start,
                     transition_info.dst_offset,
-                ))
+                )?)
             } else {
                 Some(dst_start_seconds)
             };
@@ -164,7 +164,7 @@ impl PosixZone {
                     year - 1,
                     dst_transition_info.end,
                     transition_info.std_offset,
-                ))
+                )?)
             } else {
                 Some(dst_end_seconds)
             };
@@ -182,19 +182,19 @@ impl DstTransitionInfoForYear {
         std_offset_seconds: i64,
         dst_transition: &ZeroPosixTransition,
         year: i32,
-    ) -> Self {
+    ) -> TimeZoneProviderResult<Self> {
         let std_offset = UtcOffsetSeconds(std_offset_seconds);
         let dst_offset = UtcOffsetSeconds(std_offset_seconds + dst_transition.savings);
         let dst_start_seconds =
-            calculate_transition_seconds_for_year(year, dst_transition.start, std_offset);
+            calculate_transition_seconds_for_year(year, dst_transition.start, std_offset)?;
         let dst_end_seconds =
-            calculate_transition_seconds_for_year(year, dst_transition.end, dst_offset);
-        Self {
+            calculate_transition_seconds_for_year(year, dst_transition.end, dst_offset)?;
+        Ok(Self {
             dst_start_seconds,
             dst_end_seconds,
             std_offset,
             dst_offset,
-        }
+        })
     }
 }
 
@@ -202,7 +202,7 @@ fn calculate_transition_seconds_for_year(
     year: i32,
     transition_dt: ZeroTransitionDateTime,
     offset: UtcOffsetSeconds,
-) -> i64 {
+) -> TimeZoneProviderResult<i64> {
     // Determine the year of the requested time.
     let year_epoch_seconds = i64::from(utils::epoch_days_for_year(year)) * 86400;
     let is_leap = utils::is_leap(year);
@@ -214,12 +214,17 @@ fn calculate_transition_seconds_for_year(
             kind: DateKind::JulianNoLeap,
             day: Some(day),
             ..
-        } => day,
+        } if day > 59 => day - 1 + is_leap as u16,
+        ZeroTransitionDate {
+            kind: DateKind::JulianNoLeap,
+            day: Some(day),
+            ..
+        } => day - 1,
         ZeroTransitionDate {
             kind: DateKind::Julian,
             day: Some(day),
             ..
-        } => day + 1,
+        } => day,
         ZeroTransitionDate {
             kind: DateKind::MonthWeekDay,
             mwd: Some((month, week, day)),
@@ -273,12 +278,16 @@ fn calculate_transition_seconds_for_year(
 
             days_to_month + day_of_month as u16
         }
-        _ => panic!("Invalid TransitionDate found."),
+        _ => {
+            return Err(TimeZoneProviderError::Assert(
+                "Invalid TransitionDate found.",
+            ))
+        }
     };
 
     // Transition time is on local time, so we need to add the UTC offset to get the correct UTC timestamp
     // for the transition.
-    year_epoch_seconds + i64::from(days) * 86400 + transition_dt.time - offset.0
+    Ok(year_epoch_seconds + i64::from(days) * 86400 + transition_dt.time - offset.0)
 }
 
 fn cmp_seconds_to_transitions(
@@ -286,10 +295,7 @@ fn cmp_seconds_to_transitions(
     end: &ZeroTransitionDate,
     seconds: i64,
 ) -> TimeZoneProviderResult<(bool, TransitionType)> {
-    // Assert the kinds are equal
-    assert_eq!(start.kind, end.kind);
-
-    let cmp_result = match (start.to_enum(), end.to_enum()) {
+    let cmp_result = match (start.to_enum()?, end.to_enum()?) {
         (
             TransitionDate::Mwd((start_month, start_week, start_day)),
             TransitionDate::Mwd((end_month, end_week, end_day)),
@@ -443,24 +449,24 @@ pub struct ZeroTransitionDate {
 }
 
 impl ZeroTransitionDate {
-    pub(crate) fn to_enum(self) -> TransitionDate {
+    pub(crate) fn to_enum(self) -> TimeZoneProviderResult<TransitionDate> {
         match self {
             ZeroTransitionDate {
                 kind: DateKind::JulianNoLeap,
                 day: Some(day),
                 ..
-            } => TransitionDate::JulianNoLeap(day),
+            } => Ok(TransitionDate::JulianNoLeap(day)),
             ZeroTransitionDate {
                 kind: DateKind::Julian,
                 day: Some(day),
                 ..
-            } => TransitionDate::Julian(day),
+            } => Ok(TransitionDate::Julian(day)),
             ZeroTransitionDate {
                 kind: DateKind::MonthWeekDay,
                 mwd: Some(mwd),
                 ..
-            } => TransitionDate::Mwd(mwd),
-            _ => panic!("Invalid ZeroTransitionDate"),
+            } => Ok(TransitionDate::Mwd(mwd)),
+            _ => Err(TimeZoneProviderError::Assert("Invalid ZeroTransitionDate")),
         }
     }
 }

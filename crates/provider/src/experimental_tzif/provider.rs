@@ -426,7 +426,7 @@ impl<'data> ZeroTzif<'data> {
         let year = utils::epoch_time_to_iso_year(epoch_seconds_for_year_calculation * 1000);
 
         let transition_info =
-            DstTransitionInfoForYear::compute_zero_transition(posix.offset, dst_variant, year);
+            DstTransitionInfoForYear::compute_zero_transition(posix.offset, dst_variant, year)?;
 
         let range = transition_info.transition_range();
 
@@ -463,7 +463,7 @@ impl<'data> ZeroTzif<'data> {
                         posix.offset,
                         dst_variant,
                         year + 1,
-                    );
+                    )?;
 
                     transition_info.transition_range().start
                 };
@@ -475,7 +475,7 @@ impl<'data> ZeroTzif<'data> {
                         posix.offset,
                         dst_variant,
                         year - 1,
-                    )
+                    )?
                     .transition_range()
                     .end
                 } else {
@@ -496,7 +496,7 @@ impl<'data> ZeroTzif<'data> {
                             posix.offset,
                             dst_variant,
                             year + 1,
-                        )
+                        )?
                         .transition_range()
                         .start
                     }
@@ -525,7 +525,7 @@ impl<'data> ZeroTzif<'data> {
                         posix.offset,
                         dst_variant,
                         year - 1,
-                    );
+                    )?;
 
                     transition_info.transition_range().end
                 }
