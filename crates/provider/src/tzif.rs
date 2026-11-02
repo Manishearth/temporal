@@ -32,8 +32,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::common::{
-    offset_range, resolve_posix_epoch_seconds, DstTransitionInfoForYear, LocalTimeRecordResult,
-    Mwd, MwdForTime, TimeZoneTransitionInfo, TransitionKind, TransitionType,
+    resolve_posix_epoch_seconds, resolve_posix_local_seconds, DstTransitionInfoForYear,
+    LocalTimeRecordResult, TimeZoneTransitionInfo, TransitionKind,
 };
 use crate::provider::EpochNanosecondsAndOffset;
 use crate::CompiledNormalizer;
@@ -50,7 +50,7 @@ use combine::Parser;
 use tzif::{
     self,
     data::{
-        posix::{PosixTzString, TransitionDay},
+        posix::PosixTzString,
         time::Seconds,
         tzif::{DataBlock, LocalTimeTypeRecord, TzifData, TzifHeader},
     },
@@ -805,130 +805,13 @@ fn resolve_posix_tz_string(
         return Ok(UtcOffsetSeconds::from(&posix_tz_string.std_info).into());
     };
 
-    // TODO: Resolve safety issue around utils.
-    //   Using f64 is a hold over from early implementation days and should
-    //   be moved away from.
-
-    // NOTE:
-    // STD -> DST == start
-    // DST -> STD == end
-    let (is_transition_day, mut is_dst) =
-        cmp_seconds_to_transitions(&dst.start_date.day, &dst.end_date.day, seconds)?;
-    if is_transition_day {
-        let time = utils::epoch_ms_to_ms_in_day(seconds * 1_000) as i64 / 1_000;
-        let transition_time = if is_dst == TransitionType::Dst {
-            dst.start_date.time
-        } else {
-            dst.end_date.time
-        };
-        // Convert to UtcOffsetSeconds so that these behave like
-        // normal offsets
-        let std = UtcOffsetSeconds::from(std);
-        let dst = UtcOffsetSeconds::from(&dst.variant_info);
-        let transition_diff = if is_dst == TransitionType::Dst {
-            dst.0 - std.0
-        } else {
-            std.0 - dst.0
-        };
-        let offset = offset_range(transition_time.0 + transition_diff, transition_time.0);
-        match offset.contains(&time) {
-            true if is_dst == TransitionType::Dst => {
-                return Ok(LocalTimeRecordResult::Empty(GapEntryOffsets {
-                    offset_before: std,
-                    offset_after: dst,
-                    transition_epoch: transition_time.into(),
-                }));
-            }
-            true => {
-                // Note(nekevss, manishearth): We may need to more carefully
-                // handle inverse DST here.
-                return Ok(LocalTimeRecordResult::Ambiguous {
-                    first: dst,
-                    second: std,
-                });
-            }
-            _ => {}
-        }
-
-        // We were not contained in the transition above,
-        // AND we are before it, which means we are actually in
-        // the other transition!
-        //
-        // NOTE(Manishearth) do we need to do anything special
-        // here if we end up back at the tzif transition data?
-        if time < offset.start {
-            is_dst.invert();
-        }
-    }
-
-    match is_dst {
-        TransitionType::Dst => Ok(UtcOffsetSeconds::from(&dst.variant_info).into()),
-        TransitionType::Std => Ok(UtcOffsetSeconds::from(&posix_tz_string.std_info).into()),
-    }
-}
-
-fn cmp_seconds_to_transitions(
-    start: &TransitionDay,
-    end: &TransitionDay,
-    seconds: i64,
-) -> TimeZoneProviderResult<(bool, TransitionType)> {
-    let cmp_result = match (start, end) {
-        (
-            TransitionDay::Mwd(start_month, start_week, start_day),
-            TransitionDay::Mwd(end_month, end_week, end_day),
-        ) => {
-            let mwd = MwdForTime::from_seconds(seconds);
-            let mut start = Mwd::from_u16(*start_month, *start_week, *start_day);
-            let mut end = Mwd::from_u16(*end_month, *end_week, *end_day);
-
-            mwd.normalize_mwd(&mut start);
-            mwd.normalize_mwd(&mut end);
-
-            let is_transition = start == mwd.mwd || end == mwd.mwd;
-            let is_dst = if start > end {
-                mwd.mwd < end || start <= mwd.mwd
-            } else {
-                start <= mwd.mwd && mwd.mwd < end
-            };
-
-            (is_transition, is_dst)
-        }
-        (TransitionDay::WithLeap(start), TransitionDay::WithLeap(end)) => {
-            let day_in_year = utils::epoch_time_to_day_in_year(seconds * 1_000) as u16;
-            let is_transition = *start == day_in_year || *end == day_in_year;
-            let is_dst = if start > end {
-                day_in_year < *end || *start <= day_in_year
-            } else {
-                *start <= day_in_year && day_in_year < *end
-            };
-            (is_transition, is_dst)
-        }
-        // TODO: do we need to modify the logic for leap years?
-        (TransitionDay::NoLeap(start), TransitionDay::NoLeap(end)) => {
-            let day_in_year = utils::epoch_time_to_day_in_year(seconds * 1_000) as u16;
-            let is_transition = *start == day_in_year || *end == day_in_year;
-            let is_dst = if start > end {
-                day_in_year < *end || *start <= day_in_year
-            } else {
-                *start <= day_in_year && day_in_year < *end
-            };
-            (is_transition, is_dst)
-        }
-        // NOTE: The assumption here is that mismatched day types on
-        // a POSIX string is an illformed string.
-        _ => {
-            return Err(TimeZoneProviderError::Assert(
-                "Mismatched day types on a POSIX string.",
-            ))
-        }
-    };
-
-    match cmp_result {
-        (true, dst) if dst => Ok((true, TransitionType::Dst)),
-        (true, _) => Ok((true, TransitionType::Std)),
-        (false, dst) if dst => Ok((false, TransitionType::Dst)),
-        (false, _) => Ok((false, TransitionType::Std)),
-    }
+    resolve_posix_local_seconds(
+        (dst.start_date.day.into(), dst.start_date.time.0),
+        (dst.end_date.day.into(), dst.end_date.time.0),
+        UtcOffsetSeconds::from(std),
+        UtcOffsetSeconds::from(&dst.variant_info),
+        seconds,
+    )
 }
 
 /// Timezone provider that uses compiled data.

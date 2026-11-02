@@ -1,8 +1,9 @@
 //! Common logic shared across TZif providers
 
 use crate::{
-    provider::{GapEntryOffsets, UtcOffsetSeconds},
-    utils,
+    epoch_nanoseconds::EpochNanoseconds,
+    provider::{GapEntryOffsets, TimeZoneProviderResult, UtcOffsetSeconds},
+    utils, TimeZoneProviderError,
 };
 
 use core::ops::Range;
@@ -284,13 +285,13 @@ pub(crate) fn resolve_posix_epoch_seconds(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TransitionType {
+enum TransitionType {
     Dst,
     Std,
 }
 
 impl TransitionType {
-    pub(crate) fn invert(&mut self) {
+    fn invert(&mut self) {
         *self = match *self {
             Self::Dst => Self::Std,
             Self::Std => Self::Dst,
@@ -309,8 +310,7 @@ pub(crate) struct Mwd {
 }
 
 impl Mwd {
-    #[cfg(feature = "tzif")]
-    pub(crate) fn from_u16(month: u16, week: u16, day: u16) -> Self {
+    fn from_u16(month: u16, week: u16, day: u16) -> Self {
         Self::from_u8(
             u8::try_from(month).unwrap_or(0),
             u8::try_from(week).unwrap_or(0),
@@ -318,7 +318,7 @@ impl Mwd {
         )
     }
 
-    pub(crate) fn from_u8(month: u8, week: u8, day: u8) -> Self {
+    fn from_u8(month: u8, week: u8, day: u8) -> Self {
         Self { month, week, day }
     }
 
@@ -413,11 +413,140 @@ impl MwdForTime {
     }
 }
 
-pub(crate) fn offset_range(offset_one: i64, offset_two: i64) -> core::ops::Range<i64> {
+fn offset_range(offset_one: i64, offset_two: i64) -> core::ops::Range<i64> {
     if offset_one < offset_two {
         return offset_one..offset_two;
     }
     offset_two..offset_one
+}
+
+pub(crate) fn resolve_posix_local_seconds(
+    start: (PosixTransitionDay, i64),
+    end: (PosixTransitionDay, i64),
+    std: UtcOffsetSeconds,
+    dst: UtcOffsetSeconds,
+    local_seconds: i64,
+) -> TimeZoneProviderResult<LocalTimeRecordResult> {
+    // TODO: Resolve safety issue around utils.
+    //   Using f64 is a hold over from early implementation days and should
+    //   be moved away from.
+
+    // NOTE:
+    // STD -> DST == start
+    // DST -> STD == end
+    let (is_transition_day, mut is_dst) =
+        cmp_seconds_to_transitions(start.0, end.0, local_seconds)?;
+    if is_transition_day {
+        let time = utils::epoch_ms_to_ms_in_day(local_seconds * 1_000) as i64 / 1_000;
+        let transition_time = if is_dst == TransitionType::Dst {
+            start.1
+        } else {
+            end.1
+        };
+        let transition_diff = if is_dst == TransitionType::Dst {
+            dst.0 - std.0
+        } else {
+            std.0 - dst.0
+        };
+        let offset = offset_range(transition_time + transition_diff, transition_time);
+        match offset.contains(&time) {
+            true if is_dst == TransitionType::Dst => {
+                return Ok(LocalTimeRecordResult::Empty(GapEntryOffsets {
+                    offset_before: std,
+                    offset_after: dst,
+                    transition_epoch: EpochNanoseconds::from_seconds(transition_time),
+                }));
+            }
+            true => {
+                // Note(nekevss, manishearth): We may need to more carefully
+                // handle inverse DST here.
+                return Ok(LocalTimeRecordResult::Ambiguous {
+                    first: dst,
+                    second: std,
+                });
+            }
+            _ => {}
+        }
+
+        // We were not contained in the transition above,
+        // AND we are before it, which means we are actually in
+        // the other transition!
+        //
+        // NOTE(Manishearth) do we need to do anything special
+        // here if we end up back at the tzif transition data?
+        if time < offset.start {
+            is_dst.invert();
+        }
+    }
+
+    match is_dst {
+        TransitionType::Dst => Ok(dst.into()),
+        TransitionType::Std => Ok(std.into()),
+    }
+}
+
+fn cmp_seconds_to_transitions(
+    start: PosixTransitionDay,
+    end: PosixTransitionDay,
+    seconds: i64,
+) -> TimeZoneProviderResult<(bool, TransitionType)> {
+    let cmp_result = match (start, end) {
+        (
+            PosixTransitionDay::Mwd(start_month, start_week, start_day),
+            PosixTransitionDay::Mwd(end_month, end_week, end_day),
+        ) => {
+            let mwd = MwdForTime::from_seconds(seconds);
+            let mut start = Mwd::from_u16(start_month, start_week, start_day);
+            let mut end = Mwd::from_u16(end_month, end_week, end_day);
+
+            mwd.normalize_mwd(&mut start);
+            mwd.normalize_mwd(&mut end);
+
+            let is_transition = start == mwd.mwd || end == mwd.mwd;
+            let is_dst = if start > end {
+                mwd.mwd < end || start <= mwd.mwd
+            } else {
+                start <= mwd.mwd && mwd.mwd < end
+            };
+
+            (is_transition, is_dst)
+        }
+        (PosixTransitionDay::JulianWithLeap(start), PosixTransitionDay::JulianWithLeap(end)) => {
+            let day_in_year = utils::epoch_time_to_day_in_year(seconds * 1_000) as u16;
+            let is_transition = start == day_in_year || end == day_in_year;
+            let is_dst = if start > end {
+                day_in_year < end || start <= day_in_year
+            } else {
+                start <= day_in_year && day_in_year < end
+            };
+            (is_transition, is_dst)
+        }
+        // TODO: do we need to modify the logic for leap years?
+        (PosixTransitionDay::JulianNoLeap(start), PosixTransitionDay::JulianNoLeap(end)) => {
+            let day_in_year = utils::epoch_time_to_day_in_year(seconds * 1_000) as u16;
+            let is_transition = start == day_in_year || end == day_in_year;
+            let is_dst = if start > end {
+                day_in_year < end || start <= day_in_year
+            } else {
+                start <= day_in_year && day_in_year < end
+            };
+            (is_transition, is_dst)
+        }
+        // NOTE: The assumption here is that mismatched day types on
+        // a POSIX string is an illformed string.
+        _ => {
+            return Err(TimeZoneProviderError::Assert(
+                "Mismatched day types on a POSIX string.",
+            ))
+        }
+    };
+
+    match cmp_result {
+        (true, dst) if dst => Ok((true, TransitionType::Dst)),
+        (true, _) => Ok((true, TransitionType::Std)),
+        (false, dst) if dst => Ok((false, TransitionType::Dst)),
+        (false, _) => Ok((false, TransitionType::Std)),
+    }
 }
 
 #[derive(Debug)]
