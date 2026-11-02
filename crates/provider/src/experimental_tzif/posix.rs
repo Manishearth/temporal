@@ -1,8 +1,7 @@
 use crate::{
     common::{
-        calculate_transition_seconds_for_year, resolve_posix_epoch_seconds,
-        DstTransitionInfoForYear, LocalTimeRecordResult, PosixTransitionDay,
-        TimeZoneTransitionInfo,
+        calculate_transition_seconds_for_year, DstTransitionInfoForYear, LocalTimeRecordResult,
+        PosixTransitionDay, TimeZoneTransitionInfo,
     },
     provider::{TimeZoneProviderResult, UtcOffsetSeconds},
     TimeZoneProviderError,
@@ -53,19 +52,13 @@ impl PosixZone {
             });
         };
 
-        Ok(resolve_posix_epoch_seconds(
-            (
-                dst_transition_info.start.date.to_posix_day()?,
-                dst_transition_info.start.time,
-            ),
-            (
-                dst_transition_info.end.date.to_posix_day()?,
-                dst_transition_info.end.time,
-            ),
-            UtcOffsetSeconds(self.offset),
-            UtcOffsetSeconds(self.offset + dst_transition_info.savings),
-            epoch_seconds,
-        ))
+        DstTransitionInfoForYear::resolve_epoch_seconds(epoch_seconds, |year| {
+            DstTransitionInfoForYear::compute_zero_transition(
+                self.offset,
+                dst_transition_info,
+                year,
+            )
+        })
     }
 }
 

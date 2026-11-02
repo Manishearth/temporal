@@ -31,12 +31,13 @@ use std::path::Path;
 #[cfg(target_family = "unix")]
 use std::path::PathBuf;
 
-use crate::common::{
-    resolve_posix_epoch_seconds, DstTransitionInfoForYear, LocalTimeRecordResult,
-    TimeZoneTransitionInfo, TransitionKind,
-};
-use crate::provider::EpochNanosecondsAndOffset;
 use crate::CompiledNormalizer;
+use crate::{
+    common::{
+        DstTransitionInfoForYear, LocalTimeRecordResult, TimeZoneTransitionInfo, TransitionKind,
+    },
+    provider::EpochNanosecondsAndOffset,
+};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -779,16 +780,13 @@ fn resolve_posix_tz_string_for_epoch_seconds(
         });
     };
 
-    Ok(resolve_posix_epoch_seconds(
-        (
-            dst_variant.start_date.day.into(),
-            dst_variant.start_date.time.0,
-        ),
-        (dst_variant.end_date.day.into(), dst_variant.end_date.time.0),
-        UtcOffsetSeconds::from(&posix_tz_string.std_info),
-        UtcOffsetSeconds::from(&dst_variant.variant_info),
-        seconds,
-    ))
+    DstTransitionInfoForYear::resolve_epoch_seconds(seconds, |year| {
+        Ok(DstTransitionInfoForYear::compute(
+            posix_tz_string,
+            dst_variant,
+            year,
+        ))
+    })
 }
 
 /// Resolve the footer of a tzif file.

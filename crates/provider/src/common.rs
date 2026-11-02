@@ -280,6 +280,65 @@ impl DstTransitionInfoForYear {
 
         Ok(LocalTimeRecordResult::Single(second.next))
     }
+
+    /// Resolves the active offset and preceding transition epoch for exact UTC `epoch_seconds`.
+    pub(crate) fn resolve_epoch_seconds(
+        epoch_seconds: i64,
+        compute_for_year: impl Fn(i32) -> TimeZoneProviderResult<Self>,
+    ) -> TimeZoneProviderResult<TimeZoneTransitionInfo> {
+        let year = utils::epoch_time_to_iso_year(epoch_seconds * 1_000);
+        let (first, second) = compute_for_year(year)?.ordered_transitions();
+
+        if epoch_seconds < first.transition_time {
+            let (prev_first, prev_second) = compute_for_year(year - 1)?.ordered_transitions();
+            if epoch_seconds < prev_first.transition_time {
+                let (_, prev2_second) = compute_for_year(year - 2)?.ordered_transitions();
+                return Ok(TimeZoneTransitionInfo {
+                    offset: prev_first.prev,
+                    transition_epoch: Some(prev2_second.transition_time),
+                });
+            }
+            if epoch_seconds < prev_second.transition_time {
+                return Ok(TimeZoneTransitionInfo {
+                    offset: prev_second.prev,
+                    transition_epoch: Some(prev_first.transition_time),
+                });
+            }
+            return Ok(TimeZoneTransitionInfo {
+                offset: first.prev,
+                transition_epoch: Some(prev_second.transition_time),
+            });
+        }
+
+        if epoch_seconds < second.transition_time {
+            return Ok(TimeZoneTransitionInfo {
+                offset: first.next,
+                transition_epoch: Some(first.transition_time),
+            });
+        }
+
+        let next_year_start_seconds = i64::from(utils::epoch_days_for_year(year + 1)) * 86_400;
+        if next_year_start_seconds - epoch_seconds < Self::BOUNDARY_WINDOW_SECONDS {
+            let (next_first, next_second) = compute_for_year(year + 1)?.ordered_transitions();
+            if epoch_seconds >= next_second.transition_time {
+                return Ok(TimeZoneTransitionInfo {
+                    offset: next_second.next,
+                    transition_epoch: Some(next_second.transition_time),
+                });
+            }
+            if epoch_seconds >= next_first.transition_time {
+                return Ok(TimeZoneTransitionInfo {
+                    offset: next_first.next,
+                    transition_epoch: Some(next_first.transition_time),
+                });
+            }
+        }
+
+        Ok(TimeZoneTransitionInfo {
+            offset: second.next,
+            transition_epoch: Some(second.transition_time),
+        })
+    }
 }
 
 pub(crate) fn calculate_transition_seconds_for_year(
@@ -354,75 +413,6 @@ pub(crate) fn calculate_transition_seconds_for_year(
     year_epoch_seconds + i64::from(days) * 86400 + transition_time_seconds - offset.0
 }
 
-pub(crate) fn resolve_posix_epoch_seconds(
-    start: (PosixTransitionDay, i64),
-    end: (PosixTransitionDay, i64),
-    std_offset: UtcOffsetSeconds,
-    dst_offset: UtcOffsetSeconds,
-    epoch_seconds: i64,
-) -> TimeZoneTransitionInfo {
-    let year = utils::epoch_time_to_iso_year(epoch_seconds * 1000);
-
-    let dst_start_seconds =
-        calculate_transition_seconds_for_year(year, start.0, start.1, std_offset);
-    let dst_end_seconds = calculate_transition_seconds_for_year(year, end.0, end.1, dst_offset);
-
-    // Need to determine if the range being tested is standard or savings time.
-    let dst_is_inversed = dst_end_seconds < dst_start_seconds;
-
-    // We have potentially to different variations of the DST start and end time.
-    //
-    // Northern hemisphere: dst_start -> dst_end
-    // Southern hemisphere: dst_end -> dst_start
-    //
-    // This is primarily due to the summer / winter months of those areas.
-    //
-    // For the northern hemispere, we can check if the range contains the seconds. For the
-    // southern hemisphere, we check if the range does no contain the value.
-    let should_return_dst = (!dst_is_inversed
-        && (dst_start_seconds..dst_end_seconds).contains(&epoch_seconds))
-        || (dst_is_inversed && !(dst_end_seconds..dst_start_seconds).contains(&epoch_seconds));
-
-    // Expanding on the above, the state of time zones in the year are:
-    //
-    // Northern hemisphere: STD -> DST -> STD
-    // Southern hemisphere: DST -> STD -> DST
-    //
-    // This is simple for the returning the offsets, but if the seconds value falls into the first
-    // available rule. However, the northern hemisphere's first STD rule and the Southern hemisphere's
-    // first DST rule will have different transition times that are based in the year prior, so if the
-    // requested seconds falls in that range, we calculate the transition time for the prior year.
-    let (new_offset, transition_epoch) = if should_return_dst {
-        let transition_epoch = if dst_is_inversed && epoch_seconds < dst_end_seconds {
-            Some(calculate_transition_seconds_for_year(
-                year - 1,
-                start.0,
-                start.1,
-                dst_offset,
-            ))
-        } else {
-            Some(dst_start_seconds)
-        };
-        (dst_offset, transition_epoch)
-    } else {
-        let transition_epoch = if !dst_is_inversed && epoch_seconds < dst_start_seconds {
-            Some(calculate_transition_seconds_for_year(
-                year - 1,
-                end.0,
-                end.1,
-                std_offset,
-            ))
-        } else {
-            Some(dst_end_seconds)
-        };
-        (std_offset, transition_epoch)
-    };
-    TimeZoneTransitionInfo {
-        offset: new_offset,
-        transition_epoch,
-    }
-}
-
 #[derive(Debug)]
 pub(crate) enum TransitionKind {
     // The offsets didn't change (happens when abbreviations/savings values change)
@@ -437,7 +427,7 @@ pub(crate) enum TransitionKind {
 mod tests {
     use super::{
         calculate_transition_seconds_for_year, DstTransitionInfoForYear, LocalTimeRecordResult,
-        PosixTransitionDay,
+        PosixTransitionDay, TimeZoneTransitionInfo,
     };
     use crate::{
         epoch_nanoseconds::EpochNanoseconds,
@@ -668,6 +658,31 @@ mod tests {
             )
             .unwrap(),
             LocalTimeRecordResult::Single(UtcOffsetSeconds(3_600))
+        );
+
+        // Verify resolve_epoch_seconds in January returns the exact UTC transition_epoch from year - 1
+        // (Europe/Berlin: CET-1CEST,M3.5.0/2,M10.5.0/3; Oct 29, 2028 03:00 CEST = 1856394000 UTC).
+        let berlin = |y| {
+            Ok(make_year_info(
+                y,
+                3_600,
+                7_200,
+                PosixTransitionDay::Mwd(3, 5, 0),
+                7_200,
+                PosixTransitionDay::Mwd(10, 5, 0),
+                10_800,
+            ))
+        };
+        assert_eq!(
+            DstTransitionInfoForYear::resolve_epoch_seconds(
+                local_secs(2029, 1, 15, 12, 0, 0),
+                berlin,
+            )
+            .unwrap(),
+            TimeZoneTransitionInfo {
+                offset: UtcOffsetSeconds(3_600),
+                transition_epoch: Some(1_856_394_000),
+            }
         );
     }
 }
